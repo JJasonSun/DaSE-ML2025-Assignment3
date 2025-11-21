@@ -9,7 +9,7 @@
 
 ## 2. 优化策略
 
-为了在保持 AUC >= 0.98 的前提下尽可能降低 Latency（$\sqrt{Train \times Test}$），我们采取了以下激进的优化措施：
+为了在保持 AUC >= 0.98 的前提下尽可能降低 Latency($\sqrt{Train \times Test}$)，我们采取了以下激进的优化措施：
 
 ### 2.1 Tree Compilation (树编译技术)
 
