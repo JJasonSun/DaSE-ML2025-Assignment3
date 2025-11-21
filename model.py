@@ -1,4 +1,5 @@
 import numpy as np
+import math
 
 class TreeNode:
     def __init__(self, is_leaf=False, value=0.0, feature_idx=None, threshold=None, threshold_bin=None, left=None, right=None):
@@ -21,7 +22,6 @@ class XGBoostTree:
         self.colsample_bytree = colsample_bytree
         self.root = None
         self.bin_edges = None
-        self.flat_struct = None
 
     def fit(self, X_binned, g, h, bin_edges):
         self.bin_edges = bin_edges
@@ -146,67 +146,30 @@ class XGBoostTree:
         if len(right_indices) > 0:
             self._predict_binned_recursive(X_binned, right_indices, node.right, predictions)
 
-    def flatten(self):
-        # Flatten the tree into arrays for fast inference
-        # Structure: feature_idx, threshold, left_idx, right_idx, value, is_leaf
-        node_list = []
-        q = [self.root]
-        while q:
-            node = q.pop(0)
-            node.my_idx = len(node_list)
-            node_list.append(node)
-            if not node.is_leaf:
-                q.append(node.left)
-                q.append(node.right)
-        
-        # Build NumPy arrays for faster access
-        n = len(node_list)
-        feature_indices = np.full(n, -1, dtype=np.int32)
-        thresholds = np.zeros(n, dtype=np.float64)
-        left_children = np.full(n, -1, dtype=np.int32)
-        right_children = np.full(n, -1, dtype=np.int32)
-        values = np.zeros(n, dtype=np.float64)
-        
-        for i, node in enumerate(node_list):
-            if node.is_leaf:
-                values[i] = node.value
-            else:
-                feature_indices[i] = node.feature_idx
-                thresholds[i] = node.threshold
-                left_children[i] = node.left.my_idx
-                right_children[i] = node.right.my_idx
-                
-        return {
-            'feature_indices': feature_indices,
-            'thresholds': thresholds,
-            'left_children': left_children,
-            'right_children': right_children,
-            'values': values
-        }
-
 
 class Model:
-    def __init__(self, n_features=41, random_state=42):
+    def __init__(self, n_features=41, feature_names=None, random_state=42):
         self.n_features = n_features
+        self.feature_names = feature_names
+        self.encoders = {}
         self.trees = []
         self.bin_edges = []
-        self.n_bins = 16
+        self.n_bins = 8
         self.max_depth = 3
-        self.learning_rate = 0.6
+        self.learning_rate = 1.0
         self.lambda_reg = 1.0
         self.gamma = 0.1
         self.min_child_weight = 1.0
         self.colsample_bytree = 0.8
         self.subsample = 0.8
         self.base_score = 0.0
-        # Cache flattened structures for faster access
-        self.tree_structs = [] 
+        self.fast_predict = None
         
     def _sigmoid(self, z):
         z = np.clip(z, -100, 100) 
         return 1 / (1 + np.exp(-z))
 
-    def fit(self, X, y, learning_rate=0.5, epochs=5):
+    def fit(self, X, y, learning_rate=0.6, epochs=4):
         self.learning_rate = learning_rate
         preds = np.full(y.shape, self.base_score)
         
@@ -251,35 +214,64 @@ class Model:
                 colsample_bytree=self.colsample_bytree
             )
             tree.fit(X_sample, g_sample, h_sample, self.bin_edges)
-            flat_struct = tree.flatten()
-            # Store as tuple for faster access
-            self.tree_structs.append((
-                flat_struct['feature_indices'],
-                flat_struct['thresholds'],
-                flat_struct['left_children'],
-                flat_struct['right_children'],
-                flat_struct['values']
-            ))
             self.trees.append(tree)
             
             update = tree.predict_binned(X_binned)
             preds += self.learning_rate * update
+            
+        self._compile_trees()
+
+    def _compile_trees(self):
+        code_lines = []
+        code_lines.append("def fast_predict(x):")
+        code_lines.append(f"    val = {self.base_score}")
+        
+        # Helper to handle feature access
+        use_dict = self.feature_names is not None
+        
+        for i, tree in enumerate(self.trees):
+            def visit(node, indent):
+                if node.is_leaf:
+                    # Bake learning rate into the value
+                    val = self.learning_rate * node.value
+                    return [f"{indent}val += {val}"]
+                
+                lines = []
+                if use_dict:
+                    fname = self.feature_names[node.feature_idx]
+                    if fname in self.encoders:
+                        cond = f"encoders['{fname}'].get(x['{fname}'], 0) <= {node.threshold}"
+                    else:
+                        cond = f"x['{fname}'] <= {node.threshold}"
+                    
+                    lines.append(f"{indent}if {cond}:")
+                    lines.extend(visit(node.left, indent + "    "))
+                    lines.append(f"{indent}else:")
+                    lines.extend(visit(node.right, indent + "    "))
+                else:
+                    lines.append(f"{indent}if x[{node.feature_idx}] <= {node.threshold}:")
+                    lines.extend(visit(node.left, indent + "    "))
+                    lines.append(f"{indent}else:")
+                    lines.extend(visit(node.right, indent + "    "))
+                return lines
+
+            code_lines.extend(visit(tree.root, "    "))
+            
+        code_lines.append("    return val")
+        
+        source = "\n".join(code_lines)
+        namespace = {'encoders': self.encoders}
+        exec(source, namespace)
+        self.fast_predict = namespace['fast_predict']
 
     def predict_proba_single(self, x):
-        """Optimized single sample prediction"""
-        pred = self.base_score
-        for f_indices, thresholds, left_children, right_children, values in self.tree_structs:
-            idx = 0
-            while f_indices[idx] != -1:
-                if x[f_indices[idx]] <= thresholds[idx]:
-                    idx = left_children[idx]
-                else:
-                    idx = right_children[idx]
-            pred += self.learning_rate * values[idx]
+        """Optimized single sample prediction using compiled code"""
+        pred = self.fast_predict(x)
         
-        # Inline sigmoid for single value
-        pred = np.clip(pred, -100, 100)
-        return 1.0 / (1.0 + np.exp(-pred))
+        # Inline sigmoid with math.exp for speed
+        if pred < -100: return 0.0
+        if pred > 100: return 1.0
+        return 1.0 / (1.0 + math.exp(-pred))
     
     def predict_proba(self, X):
         if X.shape[0] == 1:
