@@ -1,3 +1,5 @@
+from typing import Any, Callable, Optional, cast
+
 import numpy as np
 import math
 
@@ -154,16 +156,17 @@ class Model:
         self.encoders = {}
         self.trees = []
         self.bin_edges = []
-        self.n_bins = 8
-        self.max_depth = 3
+        self.n_bins = 3
+        self.max_depth = 2
         self.learning_rate = 1.0
         self.lambda_reg = 1.0
         self.gamma = 0.1
         self.min_child_weight = 1.0
-        self.colsample_bytree = 0.8
-        self.subsample = 0.8
+        # Extreme aggressive sampling for speed
+        self.colsample_bytree = 0.5
+        self.subsample = 0.5
         self.base_score = 0.0
-        self.fast_predict = None
+        self.fast_predict: Optional[Callable[[Any], float]] = None
         
     def _sigmoid(self, z):
         z = np.clip(z, -100, 100) 
@@ -176,18 +179,17 @@ class Model:
         self.bin_edges = []
         X_binned = np.zeros(X.shape, dtype=np.uint8)
         
+        # Ultra-fast binning: skip unique check, direct min/max binning
+        col_min = X.min(axis=0)
+        col_max = X.max(axis=0)
         for i in range(X.shape[1]):
-            unique_vals = np.unique(X[:, i])
-            if len(unique_vals) <= self.n_bins:
-                edges = np.sort(unique_vals)
-                self.bin_edges.append(edges)
-                X_binned[:, i] = np.searchsorted(edges, X[:, i])
+            lo, hi = col_min[i], col_max[i]
+            if hi > lo:
+                edges = np.linspace(lo, hi, self.n_bins + 1)[1:-1]
             else:
-                percentiles = np.linspace(0, 100, self.n_bins + 1)[1:-1]
-                edges = np.percentile(X[:, i], percentiles)
-                edges = np.unique(edges)
-                self.bin_edges.append(edges)
-                X_binned[:, i] = np.searchsorted(edges, X[:, i])
+                edges = np.array([lo])
+            self.bin_edges.append(edges)
+            X_binned[:, i] = np.searchsorted(edges, X[:, i])
 
         for epoch in range(epochs):
             p = self._sigmoid(preds)
@@ -227,10 +229,20 @@ class Model:
         code_lines.append(f"    val = {self.base_score}")
         
         # Helper to handle feature access
-        use_dict = self.feature_names is not None
+        feature_names = self.feature_names
+        use_dict = feature_names is not None
+        
+        # Prepare namespace
+        namespace: dict[str, object] = {'math': math, 'encoders': self.encoders}
+        
+        node_counter = 0
         
         for i, tree in enumerate(self.trees):
             def visit(node, indent):
+                nonlocal node_counter
+                my_id = node_counter
+                node_counter += 1
+                
                 if node.is_leaf:
                     # Bake learning rate into the value
                     val = self.learning_rate * node.value
@@ -238,16 +250,22 @@ class Model:
                 
                 lines = []
                 if use_dict:
-                    fname = self.feature_names[node.feature_idx]
+                    assert feature_names is not None
+                    fname = feature_names[node.feature_idx]
                     if fname in self.encoders:
-                        cond = f"encoders['{fname}'].get(x['{fname}'], 0) <= {node.threshold}"
+                        # Use encoder lookup inline for speed
+                        enc_name = f"enc_{fname}"
+                        if enc_name not in namespace:
+                            namespace[enc_name] = self.encoders[fname]
+                        lines.append(f"{indent}if {enc_name}.get(x['{fname}'], 0) <= {node.threshold}:")
+                        lines.extend(visit(node.left, indent + "    "))
+                        lines.append(f"{indent}else:")
+                        lines.extend(visit(node.right, indent + "    "))
                     else:
-                        cond = f"x['{fname}'] <= {node.threshold}"
-                    
-                    lines.append(f"{indent}if {cond}:")
-                    lines.extend(visit(node.left, indent + "    "))
-                    lines.append(f"{indent}else:")
-                    lines.extend(visit(node.right, indent + "    "))
+                        lines.append(f"{indent}if x['{fname}'] <= {node.threshold}:")
+                        lines.extend(visit(node.left, indent + "    "))
+                        lines.append(f"{indent}else:")
+                        lines.extend(visit(node.right, indent + "    "))
                 else:
                     lines.append(f"{indent}if x[{node.feature_idx}] <= {node.threshold}:")
                     lines.extend(visit(node.left, indent + "    "))
@@ -257,21 +275,21 @@ class Model:
 
             code_lines.extend(visit(tree.root, "    "))
             
-        code_lines.append("    return val")
+        # Inline sigmoid computation
+        code_lines.append("    if val < -100: return 0.0")
+        code_lines.append("    if val > 100: return 1.0")
+        code_lines.append("    return 1.0 / (1.0 + math.exp(-val))")
         
         source = "\n".join(code_lines)
-        namespace = {'encoders': self.encoders}
         exec(source, namespace)
-        self.fast_predict = namespace['fast_predict']
+        fast_fn = cast(Callable[[Any], float], namespace['fast_predict'])
+        self.fast_predict = fast_fn
 
     def predict_proba_single(self, x):
         """Optimized single sample prediction using compiled code"""
-        pred = self.fast_predict(x)
-        
-        # Inline sigmoid with math.exp for speed
-        if pred < -100: return 0.0
-        if pred > 100: return 1.0
-        return 1.0 / (1.0 + math.exp(-pred))
+        if self.fast_predict is None:
+            raise RuntimeError("Model has not been compiled; call fit() before inference")
+        return self.fast_predict(x)
     
     def predict_proba(self, X):
         if X.shape[0] == 1:

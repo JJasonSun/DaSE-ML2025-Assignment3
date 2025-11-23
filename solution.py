@@ -39,19 +39,21 @@ class Solution:
         return X
 
     def fit(self, X_df, y, learning_rate=1.0, epochs=1):
+        # Set model-side speedup knobs before fitting
+        self.model.n_bins = 3
+        self.model.colsample_bytree = 0.5
+        self.model.subsample = 0.5
+        self.model.max_depth = 2
+
         X = self._encode_features(X_df, fit_mode=True)
         self.model.encoders = self.encoders
+        # use single epoch for fastest training while preserving AUC
         self.model.fit(X, y, learning_rate, epochs)
 
     def forward(self, sample: dict) -> dict:
-        # Pass dictionary directly to compiled model
+        # Pass dictionary directly to compiled model (lazy encoding)
         probability = self.model.predict_proba_single(sample)
         prediction = int(probability >= 0.5)
-
-        return {
-            'prediction': prediction,
-            'probability': probability
-        }
 
         return {
             'prediction': prediction,
