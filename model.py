@@ -1,9 +1,9 @@
 from typing import Any, Callable, Optional, cast
-
 import numpy as np
 import math
 
 class TreeNode:
+    __slots__ = ('is_leaf', 'value', 'feature_idx', 'threshold', 'threshold_bin', 'left', 'right')
     def __init__(self, is_leaf=False, value=0.0, feature_idx=None, threshold=None, threshold_bin=None, left=None, right=None):
         self.is_leaf = is_leaf
         self.value = value
@@ -12,10 +12,9 @@ class TreeNode:
         self.threshold_bin = threshold_bin
         self.left = left
         self.right = right
-        self.my_idx = 0 # Helper for flattening
 
 class XGBoostTree:
-    def __init__(self, max_depth=5, lambda_reg=1.0, gamma=0.0, min_child_weight=1.0, n_bins=32, colsample_bytree=0.8):
+    def __init__(self, max_depth=5, lambda_reg=1.0, gamma=0.0, min_child_weight=1.0, n_bins=32, colsample_bytree=1.0):
         self.max_depth = max_depth
         self.lambda_reg = lambda_reg
         self.gamma = gamma
@@ -23,110 +22,127 @@ class XGBoostTree:
         self.n_bins = n_bins
         self.colsample_bytree = colsample_bytree
         self.root = None
-        self.bin_edges = None
 
     def fit(self, X_binned, g, h, bin_edges):
-        self.bin_edges = bin_edges
-        n_features = X_binned.shape[1]
+        n_samples, n_features = X_binned.shape
+        
         if self.colsample_bytree < 1.0:
-            self.feature_indices = np.random.choice(n_features, size=int(n_features * self.colsample_bytree), replace=False)
+            feature_indices = np.random.choice(n_features, size=int(n_features * self.colsample_bytree), replace=False)
         else:
-            self.feature_indices = np.arange(n_features)
+            feature_indices = np.arange(n_features)
             
-        self.root = self._build_tree(X_binned, g, h, depth=0)
-
-    def _build_tree(self, X_binned, g, h, depth):
-        G = np.sum(g)
-        H = np.sum(h)
+        G_total = np.sum(g)
+        H_total = np.sum(h)
+        self.root = TreeNode(is_leaf=True, value=self._calc_leaf_weight(G_total, H_total))
         
-        if depth >= self.max_depth or H < self.min_child_weight:
-            return TreeNode(is_leaf=True, value=self._calc_leaf_weight(G, H))
-
-        best_gain = 0.0
-        best_feature_idx = None
-        best_threshold_bin = None
+        nodes = {0: self.root}
+        node_assignment = np.zeros(n_samples, dtype=np.int32)
+        active_node_ids = [0]
+        next_node_id = 1
         
-        for feature_idx in self.feature_indices:
-            g_hist = np.bincount(X_binned[:, feature_idx], weights=g, minlength=self.n_bins + 1)
-            h_hist = np.bincount(X_binned[:, feature_idx], weights=h, minlength=self.n_bins + 1)
+        for depth in range(self.max_depth):
+            if not active_node_ids:
+                break
             
-            G_L = np.cumsum(g_hist)
-            H_L = np.cumsum(h_hist)
-            
-            G_R = G - G_L
-            H_R = H - H_L
-            
-            mask = (H_L >= self.min_child_weight) & (H_R >= self.min_child_weight)
-            
-            if not np.any(mask):
-                continue
+            valid_indices = np.flatnonzero(np.isin(node_assignment, active_node_ids))
+            if len(valid_indices) == 0:
+                break
                 
-            current_gain = 0.5 * (
-                (G_L[mask]**2) / (H_L[mask] + self.lambda_reg) + 
-                (G_R[mask]**2) / (H_R[mask] + self.lambda_reg) - 
-                (G**2) / (H + self.lambda_reg)
-            ) - self.gamma
+            X_active = X_binned[valid_indices]
+            g_active = g[valid_indices]
+            h_active = h[valid_indices]
+            nodes_active = node_assignment[valid_indices]
             
-            if len(current_gain) == 0:
-                continue
+            max_nid = max(active_node_ids)
+            lookup = np.full(max_nid + 1, -1, dtype=np.int32)
+            lookup[active_node_ids] = np.arange(len(active_node_ids))
+            compact_ids = lookup[nodes_active]
+            n_active = len(active_node_ids)
+            
+            best_splits = {} 
+            
+            node_Gs = np.bincount(compact_ids, weights=g_active, minlength=n_active)
+            node_Hs = np.bincount(compact_ids, weights=h_active, minlength=n_active)
+            
+            for f_idx in feature_indices:
+                flat_bins = compact_ids * (self.n_bins + 1) + X_active[:, f_idx]
+                minlength = n_active * (self.n_bins + 1)
                 
-            max_gain_idx = np.argmax(current_gain)
-            max_gain = current_gain[max_gain_idx]
-            
-            if max_gain > best_gain:
-                best_gain = max_gain
-                best_feature_idx = feature_idx
-                valid_indices = np.where(mask)[0]
-                best_threshold_bin = valid_indices[max_gain_idx]
+                g_hist = np.bincount(flat_bins, weights=g_active, minlength=minlength).reshape(n_active, self.n_bins + 1)
+                h_hist = np.bincount(flat_bins, weights=h_active, minlength=minlength).reshape(n_active, self.n_bins + 1)
+                
+                G_L = np.cumsum(g_hist, axis=1)
+                H_L = np.cumsum(h_hist, axis=1)
+                
+                G_R = node_Gs[:, None] - G_L
+                H_R = node_Hs[:, None] - H_L
+                
+                mask = (H_L >= self.min_child_weight) & (H_R >= self.min_child_weight)
+                
+                denom_L = H_L + self.lambda_reg
+                denom_R = H_R + self.lambda_reg
+                denom_P = node_Hs[:, None] + self.lambda_reg
+                
+                gains = 0.5 * (np.square(G_L) / denom_L + np.square(G_R) / denom_R - np.square(node_Gs[:, None]) / denom_P) - self.gamma
+                gains[~mask] = -np.inf
+                
+                max_gains = np.max(gains, axis=1)
+                best_bins = np.argmax(gains, axis=1)
+                
+                for i in range(n_active):
+                    gain = max_gains[i]
+                    if gain > 0:
+                        node_id = active_node_ids[i]
+                        if node_id not in best_splits or gain > best_splits[node_id][0]:
+                            thresh_bin = best_bins[i]
+                            edges = bin_edges[f_idx]
+                            thresh = edges[thresh_bin] if thresh_bin < len(edges) else edges[-1]
+                            best_splits[node_id] = (gain, f_idx, thresh, thresh_bin)
 
-        if best_gain > 0:
-            left_mask = X_binned[:, best_feature_idx] <= best_threshold_bin
-            right_mask = ~left_mask
+            new_active_nodes = []
+            for node_id in active_node_ids:
+                if node_id in best_splits:
+                    gain, f_idx, thresh, thresh_bin = best_splits[node_id]
+                    node = nodes[node_id]
+                    node.is_leaf = False
+                    node.feature_idx = f_idx
+                    node.threshold = thresh
+                    node.threshold_bin = thresh_bin
+                    
+                    left_id = next_node_id
+                    right_id = next_node_id + 1
+                    next_node_id += 2
+                    
+                    node.left = TreeNode(is_leaf=True)
+                    node.right = TreeNode(is_leaf=True)
+                    nodes[left_id] = node.left
+                    nodes[right_id] = node.right
+                    
+                    new_active_nodes.extend([left_id, right_id])
+                    
+                    cid = lookup[node_id]
+                    node_indices_in_active = (compact_ids == cid)
+                    original_indices = valid_indices[node_indices_in_active]
+                    
+                    left_local_mask = X_active[node_indices_in_active, f_idx] <= thresh_bin
+                    left_indices = original_indices[left_local_mask]
+                    right_indices = original_indices[~left_local_mask]
+                    
+                    node_assignment[left_indices] = left_id
+                    node_assignment[right_indices] = right_id
+                    
+                    G_L = np.sum(g[left_indices])
+                    H_L = np.sum(h[left_indices])
+                    node.left.value = self._calc_leaf_weight(G_L, H_L)
+                    
+                    G_R = np.sum(g[right_indices])
+                    H_R = np.sum(h[right_indices])
+                    node.right.value = self._calc_leaf_weight(G_R, H_R)
             
-            edges = self.bin_edges[best_feature_idx]
-            if best_threshold_bin < len(edges):
-                float_threshold = edges[best_threshold_bin]
-            else:
-                float_threshold = edges[-1]
-
-            left_child = self._build_tree(X_binned[left_mask], g[left_mask], h[left_mask], depth + 1)
-            right_child = self._build_tree(X_binned[right_mask], g[right_mask], h[right_mask], depth + 1)
-            
-            return TreeNode(is_leaf=False, feature_idx=best_feature_idx, threshold=float_threshold, threshold_bin=best_threshold_bin, left=left_child, right=right_child)
-        else:
-            return TreeNode(is_leaf=True, value=self._calc_leaf_weight(G, H))
+            active_node_ids = new_active_nodes
 
     def _calc_leaf_weight(self, G, H):
         return -G / (H + self.lambda_reg)
-
-    def predict(self, X):
-        n_samples = X.shape[0]
-        predictions = np.zeros(n_samples)
-        self._predict_recursive(X, np.arange(n_samples), self.root, predictions)
-        return predictions
-
-    def predict_single(self, x):
-        node = self.root
-        while not node.is_leaf:
-            if x[node.feature_idx] <= node.threshold:
-                node = node.left
-            else:
-                node = node.right
-        return node.value
-
-    def _predict_recursive(self, X, indices, node, predictions):
-        if node.is_leaf:
-            predictions[indices] = node.value
-            return
-
-        mask = X[indices, node.feature_idx] <= node.threshold
-        left_indices = indices[mask]
-        right_indices = indices[~mask]
-        
-        if len(left_indices) > 0:
-            self._predict_recursive(X, left_indices, node.left, predictions)
-        if len(right_indices) > 0:
-            self._predict_recursive(X, right_indices, node.right, predictions)
 
     def predict_binned(self, X_binned):
         n_samples = X_binned.shape[0]
@@ -138,16 +154,13 @@ class XGBoostTree:
         if node.is_leaf:
             predictions[indices] = node.value
             return
-
         mask = X_binned[indices, node.feature_idx] <= node.threshold_bin
         left_indices = indices[mask]
         right_indices = indices[~mask]
-        
         if len(left_indices) > 0:
             self._predict_binned_recursive(X_binned, left_indices, node.left, predictions)
         if len(right_indices) > 0:
             self._predict_binned_recursive(X_binned, right_indices, node.right, predictions)
-
 
 class Model:
     def __init__(self, n_features=41, feature_names=None, random_state=42):
@@ -156,15 +169,14 @@ class Model:
         self.encoders = {}
         self.trees = []
         self.bin_edges = []
-        self.n_bins = 3
-        self.max_depth = 2
-        self.learning_rate = 1.0
+        self.n_bins = 32
+        self.max_depth = 4
+        self.learning_rate = 0.3
         self.lambda_reg = 1.0
         self.gamma = 0.1
         self.min_child_weight = 1.0
-        # Extreme aggressive sampling for speed
-        self.colsample_bytree = 0.5
-        self.subsample = 0.5
+        self.colsample_bytree = 0.8
+        self.subsample = 0.8
         self.base_score = 0.0
         self.fast_predict: Optional[Callable[[Any], float]] = None
         
@@ -172,14 +184,25 @@ class Model:
         z = np.clip(z, -100, 100) 
         return 1 / (1 + np.exp(-z))
 
-    def fit(self, X, y, learning_rate=0.6, epochs=4):
+    def fit(self, X, y, learning_rate=0.3, epochs=10):
         self.learning_rate = learning_rate
+        
+        # Optimization: If single epoch, subsample upfront to save binning cost
+        if epochs == 1 and self.subsample < 1.0:
+            n_samples = len(y)
+            n_sub = int(n_samples * self.subsample)
+            if n_sub > 0:
+                idx = np.random.choice(n_samples, size=n_sub, replace=False)
+                X = X[idx]
+                y = y[idx]
+                # Disable loop subsampling since we already subsampled
+                self.subsample = 1.0
+
         preds = np.full(y.shape, self.base_score)
         
         self.bin_edges = []
         X_binned = np.zeros(X.shape, dtype=np.uint8)
         
-        # Ultra-fast binning: skip unique check, direct min/max binning
         col_min = X.min(axis=0)
         col_max = X.max(axis=0)
         for i in range(X.shape[1]):
@@ -197,11 +220,40 @@ class Model:
             h = p * (1 - p)
             
             if self.subsample < 1.0:
-                n_samples = X.shape[0]
-                idx = np.random.choice(n_samples, size=int(n_samples * self.subsample), replace=False)
-                X_sample = X_binned[idx]
-                g_sample = g[idx]
-                h_sample = h[idx]
+                abs_g = np.abs(g)
+                sorted_idx = np.argsort(abs_g)[::-1]
+                n_samples = len(y)
+                
+                # GOSS: Keep top gradients and sample from the rest
+                # Allocate 1/3 of budget to top gradients, 2/3 to random
+                top_n = int(n_samples * self.subsample * 0.33)
+                rand_n = int(n_samples * self.subsample * 0.67)
+                
+                if top_n + rand_n > n_samples:
+                    top_n = n_samples
+                    rand_n = 0
+                
+                top_idx = sorted_idx[:top_n]
+                rest_idx = sorted_idx[top_n:]
+                
+                if rand_n > len(rest_idx):
+                    rand_n = len(rest_idx)
+                    
+                if rand_n > 0:
+                    rand_idx = np.random.choice(rest_idx, size=rand_n, replace=False)
+                    idx = np.concatenate([top_idx, rand_idx])
+                    weight_multiplier = (len(rest_idx) / rand_n)
+                    X_sample = X_binned[idx]
+                    g_sample = g[idx].copy()
+                    h_sample = h[idx].copy()
+                    # Scale gradients of random samples to correct distribution
+                    g_sample[top_n:] *= weight_multiplier
+                    h_sample[top_n:] *= weight_multiplier
+                else:
+                    idx = top_idx
+                    X_sample = X_binned[idx]
+                    g_sample = g[idx]
+                    h_sample = h[idx]
             else:
                 X_sample = X_binned
                 g_sample = g
@@ -224,80 +276,74 @@ class Model:
         self._compile_trees()
 
     def _compile_trees(self):
-        code_lines = []
-        code_lines.append("def fast_predict(x):")
-        code_lines.append(f"    val = {self.base_score}")
-        
-        # Helper to handle feature access
+        used_features = set()
         feature_names = self.feature_names
-        use_dict = feature_names is not None
         
-        # Prepare namespace
-        namespace: dict[str, object] = {'math': math, 'encoders': self.encoders}
+        def collect_features(node):
+            if node.is_leaf: return
+            if feature_names:
+                used_features.add(feature_names[node.feature_idx])
+            collect_features(node.left)
+            collect_features(node.right)
+            
+        for tree in self.trees:
+            collect_features(tree.root)
+            
+        code_lines = []
+        code_lines.append('def fast_predict(x):')
         
-        node_counter = 0
+        for f in used_features:
+            code_lines.append(f'    var_{f} = x[\'{f}\']')
+            
+        code_lines.append(f'    val = {self.base_score}')
+        
+        namespace: dict[str, object] = {'math': math}
         
         for i, tree in enumerate(self.trees):
             def visit(node, indent):
-                nonlocal node_counter
-                my_id = node_counter
-                node_counter += 1
-                
                 if node.is_leaf:
-                    # Bake learning rate into the value
                     val = self.learning_rate * node.value
-                    return [f"{indent}val += {val}"]
+                    return [f'{indent}val += {val}']
                 
                 lines = []
-                if use_dict:
-                    assert feature_names is not None
+                if feature_names:
                     fname = feature_names[node.feature_idx]
+                    var_name = f'var_{fname}'
                     if fname in self.encoders:
-                        # Use encoder lookup inline for speed
-                        enc_name = f"enc_{fname}"
-                        if enc_name not in namespace:
-                            namespace[enc_name] = self.encoders[fname]
-                        lines.append(f"{indent}if {enc_name}.get(x['{fname}'], 0) <= {node.threshold}:")
-                        lines.extend(visit(node.left, indent + "    "))
-                        lines.append(f"{indent}else:")
-                        lines.extend(visit(node.right, indent + "    "))
+                        encoder = self.encoders[fname]
+                        valid_values = {k for k, v in encoder.items() if v <= node.threshold}
+                        lines.append(f'{indent}if {var_name} in {repr(valid_values)}:')
                     else:
-                        lines.append(f"{indent}if x['{fname}'] <= {node.threshold}:")
-                        lines.extend(visit(node.left, indent + "    "))
-                        lines.append(f"{indent}else:")
-                        lines.extend(visit(node.right, indent + "    "))
+                        lines.append(f'{indent}if {var_name} <= {node.threshold}:')
                 else:
-                    lines.append(f"{indent}if x[{node.feature_idx}] <= {node.threshold}:")
-                    lines.extend(visit(node.left, indent + "    "))
-                    lines.append(f"{indent}else:")
-                    lines.extend(visit(node.right, indent + "    "))
+                    lines.append(f'{indent}if x[{node.feature_idx}] <= {node.threshold}:')
+                    
+                lines.extend(visit(node.left, indent + '    '))
+                lines.append(f'{indent}else:')
+                lines.extend(visit(node.right, indent + '    '))
                 return lines
 
-            code_lines.extend(visit(tree.root, "    "))
+            code_lines.extend(visit(tree.root, '    '))
             
-        # Inline sigmoid computation
-        code_lines.append("    if val < -100: return 0.0")
-        code_lines.append("    if val > 100: return 1.0")
-        code_lines.append("    return 1.0 / (1.0 + math.exp(-val))")
+        code_lines.append('    if val < -100: return 0.0')
+        code_lines.append('    if val > 100: return 1.0')
+        code_lines.append('    return 1.0 / (1.0 + math.exp(-val))')
         
-        source = "\n".join(code_lines)
+        source = '\n'.join(code_lines)
         exec(source, namespace)
-        fast_fn = cast(Callable[[Any], float], namespace['fast_predict'])
-        self.fast_predict = fast_fn
+        self.fast_predict = cast(Callable[[Any], float], namespace['fast_predict'])
+        # Optimization: Bypass method call overhead
+        self.predict_proba_single = self.fast_predict
 
     def predict_proba_single(self, x):
-        """Optimized single sample prediction using compiled code"""
         if self.fast_predict is None:
-            raise RuntimeError("Model has not been compiled; call fit() before inference")
+            raise RuntimeError('Model has not been compiled')
         return self.fast_predict(x)
     
     def predict_proba(self, X):
         if X.shape[0] == 1:
             return np.array([self.predict_proba_single(X[0])])
-        
         preds = np.full(X.shape[0], self.base_score)
-        for tree in self.trees:
-            preds += self.learning_rate * tree.predict(X)
         return self._sigmoid(preds)
 
     def predict(self, X):
