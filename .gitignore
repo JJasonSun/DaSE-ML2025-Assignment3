@@ -1,5 +1,5 @@
 evaluate.py
-analyze_code.py
+.env
 
 # Python编译文件
 __pycache__/
